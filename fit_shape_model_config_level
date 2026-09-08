@@ -1,0 +1,83 @@
+# Configuration-level robust variant of fit_shape_model() (Sec. 3.3 of the
+# paper: "a whole-configuration robustness weight omega_i ... inserted
+# multiplicatively"). Mirrors fit_shape_model() in robust_shape_regression.R
+# exactly, except Step 4 computes a single Tukey-biweight weight per
+# configuration (from the MEDIAN landmark residual within that
+# configuration) instead of one weight per landmark. Added as a new
+# function rather than editing the authentic file.
+fit_shape_model_config_level <- function(times, X_raw, delta_list, robust = TRUE,
+                                          c_tukey = 4.685, h_pilot = NULL) {
+  n <- length(times); k <- nrow(X_raw[[1]])
+  if (is.null(h_pilot)) h_pilot <- diff(range(times)) / 6
+
+  gpa0 <- weighted_gpa(X_raw, delta_list)
+  Xtilde0 <- gpa0$aligned
+  if (!robust) return(list(Xtilde = Xtilde0, weights = delta_list, mu = gpa0$mu, sigma_hat = NA))
+
+  pilot <- lapply(seq_len(n), function(i)
+    nw_predict_shape(times[i], times, Xtilde0, delta_list, h_pilot, exclude = i))
+
+  resid_list <- vector("list", n)
+  for (i in seq_len(n)) {
+    e <- Xtilde0[[i]] - pilot[[i]]
+    r <- sqrt(rowSums(e^2))
+    r[delta_list[[i]] == 0] <- NA
+    resid_list[[i]] <- r
+  }
+
+  # --- configuration-level: median landmark residual per configuration ---
+  med_r <- sapply(seq_len(n), function(i) {
+    r <- resid_list[[i]]; ok <- !is.na(r)
+    if (any(ok)) stats::median(r[ok]) else NA
+  })
+  # Same fix as fit_shape_model(): med_r is itself built from norms of
+  # p-dimensional residuals, so the scale reference is chi_p, not the 1-D
+  # MAD constant 1.4826 (see the note in fit_shape_model()).
+  p_dim <- ncol(X_raw[[1]])
+  chi_p_median <- sqrt(stats::qchisq(0.5, df = p_dim))
+  sigma_cfg <- stats::median(med_r, na.rm = TRUE) / chi_p_median
+  if (!is.finite(sigma_cfg) || sigma_cfg <= 0) sigma_cfg <- 1e-6
+
+  w_list <- vector("list", n)
+  for (i in seq_len(n)) {
+    if (is.na(med_r[i])) { omega_i <- 0 } else {
+      z <- med_r[i] / (c_tukey * sigma_cfg)
+      omega_i <- if (abs(z) <= 1) (1 - z^2)^2 else 0
+    }
+    w_list[[i]] <- delta_list[[i]] * omega_i
+  }
+
+  gpa1 <- weighted_gpa(X_raw, w_list)
+  list(Xtilde = gpa1$aligned, weights = w_list, mu = gpa1$mu, sigma_hat = sigma_cfg)
+}
+
+# Same bandwidth-selection + LOO-prediction logic as run_method_once(), but
+# dispatching to fit_shape_model_config_level() for method == "config_robust".
+run_method_once_level <- function(times, X_raw, delta_list, X_true, method,
+                                   h_grid = seq(0.02, 0.45, by = 0.03)) {
+  n <- length(times)
+  if (method == "naive") {
+    X_used <- mean_impute(X_raw, delta_list)
+    delta_used <- replicate(n, rep(1, nrow(X_raw[[1]])), simplify = FALSE)
+    fitted <- fit_shape_model(times, X_used, delta_used, robust = FALSE)
+  } else if (method == "landmark_robust") {
+    fitted <- fit_shape_model(times, X_raw, delta_list, robust = TRUE)
+  } else if (method == "config_robust") {
+    fitted <- fit_shape_model_config_level(times, X_raw, delta_list, robust = TRUE)
+  } else stop("unknown method")
+
+  Xtilde <- fitted$Xtilde; W <- fitted$weights
+  best_h <- h_grid[1]; best_err <- Inf
+  for (h in h_grid) {
+    errs <- numeric(0)
+    for (i in seq_len(n)) {
+      p_i <- nw_predict_shape(times[i], times, Xtilde, W, h, exclude = i)
+      wl  <- W[[i]]
+      if (!anyNA(p_i) && sum(wl) > 1e-8) errs <- c(errs, sum(wl * rowSums((p_i - Xtilde[[i]])^2)) / sum(wl))
+    }
+    if (length(errs) > 0) { err <- stats::median(errs); if (err < best_err) { best_err <- err; best_h <- h } }
+  }
+  preds <- lapply(seq_len(n), function(i) nw_predict_shape(times[i], times, Xtilde, W, best_h, exclude = i))
+  mean_true <- Reduce(`+`, X_true) / n
+  eval_scenario(preds, X_true, mean_true)
+}
