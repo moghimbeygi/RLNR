@@ -56,19 +56,31 @@
 weighted_procrustes <- function(X, Y, w) {
   k <- nrow(X); p <- ncol(X)
   w <- pmax(w, 0)
+  # Referee fix (Major point 1): a zero weight is only a safe way to drop a
+  # landmark if the underlying coordinate is also finite -- 0 * NA is NA in
+  # R, not 0, so a landmark represented by NA/NaN/Inf coordinates (as a real
+  # missing-data encoding would use, as opposed to this script's own
+  # contaminate(), which keeps the true coordinate and only zeroes delta)
+  # would silently poison every downstream sum. We therefore explicitly
+  # zero-weight and then *subset out* any non-finite row, rather than
+  # relying on multiplication by a zero weight to make it vanish.
+  finite_rows <- is.finite(rowSums(X)) & is.finite(rowSums(Y))
+  w[!finite_rows] <- 0
   W <- sum(w)
   if (W <= 1e-8) {
     return(list(beta = 1, Gamma = diag(p), gamma = rep(0, p)))
   }
+  use <- w > 0
+  Xu <- X[use, , drop = FALSE]; Yu <- Y[use, , drop = FALSE]; wu <- w[use]
 
-  xc <- colSums(w * X) / W
-  yc <- colSums(w * Y) / W
-  Xc <- sweep(X, 2, xc, "-")
-  Yc <- sweep(Y, 2, yc, "-")
+  xc <- colSums(wu * Xu) / W
+  yc <- colSums(wu * Yu) / W
+  Xc <- sweep(Xu, 2, xc, "-")
+  Yc <- sweep(Yu, 2, yc, "-")
 
-  sw <- sqrt(w)
-  A <- sw * Xc                      # D^{1/2} (X - xbar)
-  B <- sw * Yc                      # D^{1/2} (Y - ybar)
+  sw <- sqrt(wu)
+  A <- sw * Xc                      # D^{1/2} (X - xbar), missing/zero-weight rows dropped
+  B <- sw * Yc                      # D^{1/2} (Y - ybar), missing/zero-weight rows dropped
 
   M  <- crossprod(A, B)             # A' B
   sv <- svd(M)
@@ -96,10 +108,50 @@ apply_similarity <- function(X, fit) {
 # 2. Weighted generalized Procrustes analysis (GPA): aligns a whole sample to
 #    a common (weighted) mean shape, using an arbitrary landmark-weight list
 # ---------------------------------------------------------------------------
+#' @param X_list list of n raw k x p configurations. A missing landmark
+#'   should either have w_list weight 0 (this script's own contaminate()
+#'   convention -- coordinate still present but not to be used) or, for a
+#'   caller that encodes missingness as NA/NaN/Inf directly in X, the
+#'   corresponding w_list entry should also be 0 (see weighted_landmark_mean()
+#'   below, which is NA-safe either way).
 weighted_gpa <- function(X_list, w_list, max_iter = 15, tol = 1e-8) {
   n <- length(X_list); k <- nrow(X_list[[1]]); p <- ncol(X_list[[1]])
-  mu <- Reduce(`+`, X_list) / n
-  mu <- mu / sqrt(sum(mu^2))
+
+  # Referee fix (Major point 1): the starting mean shape must itself respect
+  # the missingness/robustness weights, landmark by landmark -- an unweighted
+  # Reduce(`+`, X_list)/n silently pools observed and missing/down-weighted
+  # landmarks in the very first iteration. weighted_landmark_mean() is also
+  # NA-safe: a landmark contributes to the accumulator only if its weight is
+  # positive AND its coordinate is finite, so 0 * NA can never enter a sum.
+  weighted_landmark_mean <- function(configs, weights, l, fallback) {
+    acc <- rep(0, ncol(configs[[1]])); wsum <- 0
+    for (i in seq_along(configs)) {
+      wi <- weights[[i]][l]; xi <- configs[[i]][l, ]
+      if (wi > 0 && all(is.finite(xi))) {
+        acc <- acc + wi * xi
+        wsum <- wsum + wi
+      }
+    }
+    if (wsum > 1e-8) acc / wsum else fallback
+  }
+
+  mu <- matrix(0, k, p)
+  for (l in seq_len(k)) {
+    # fallback if a landmark has zero total weight everywhere (degenerate):
+    # fall back to its raw finite-only average rather than propagating NA.
+    # If a landmark is non-finite in *every* configuration (fully
+    # unobserved landmark, k > 0 but no data anywhere -- the degenerate
+    # case flagged in Section 3.3 of the paper), colMeans(..., na.rm=TRUE)
+    # itself returns NaN; fall back to the zero vector so mu stays finite.
+    # This is safe because such a landmark also has weight 0 everywhere,
+    # so its mu row is never used with positive weight downstream anyway.
+    raw_l <- t(vapply(X_list, function(X) X[l, ], numeric(p)))
+    fallback <- colMeans(raw_l, na.rm = TRUE)
+    if (!all(is.finite(fallback))) fallback <- rep(0, p)
+    mu[l, ] <- weighted_landmark_mean(X_list, w_list, l, fallback)
+  }
+  nrm0 <- sqrt(sum(mu^2))
+  if (nrm0 > 1e-10) mu <- mu / nrm0
 
   aligned <- X_list
   for (iter in seq_len(max_iter)) {
@@ -109,14 +161,7 @@ weighted_gpa <- function(X_list, w_list, max_iter = 15, tol = 1e-8) {
     }
     newmu <- matrix(0, k, p)
     for (l in seq_len(k)) {
-      wl <- vapply(w_list, `[`, numeric(1), l)
-      wsum <- sum(wl)
-      if (wsum > 1e-8) {
-        acc <- Reduce(`+`, Map(function(X, w) w * X[l, ], aligned, as.list(wl)))
-        newmu[l, ] <- acc / wsum
-      } else {
-        newmu[l, ] <- mu[l, ]
-      }
+      newmu[l, ] <- weighted_landmark_mean(aligned, w_list, l, mu[l, ])
     }
     nrm <- sqrt(sum(newmu^2))
     if (nrm > 1e-10) newmu <- newmu / nrm
@@ -146,13 +191,22 @@ nw_predict_shape <- function(t0, times, X_list, w_list, h, exclude = NULL) {
 
   pred <- matrix(NA_real_, k, p)
   for (l in seq_len(k)) {
-    wl  <- vapply(idx, function(i) w_list[[i]][l], numeric(1))
-    wk  <- wl * Kv
-    den <- sum(wk)
-    if (den > 1e-10) {
-      num <- Reduce(`+`, Map(function(i, g) g * X_list[[i]][l, ], idx, as.list(wk)))
-      pred[l, ] <- num / den
+    # Referee fix (Major point 1): same NA-safety issue as weighted_procrustes
+    # -- a missing/zero-weight landmark's coordinate must be excluded by
+    # subsetting, not by multiplying by a zero weight that could hit a
+    # non-finite coordinate (0 * NA = NA in R).
+    acc <- rep(0, p); wsum <- 0
+    for (j in seq_along(idx)) {
+      i <- idx[j]
+      wi <- w_list[[i]][l]
+      xi <- X_list[[i]][l, ]
+      if (wi > 0 && Kv[j] > 0 && all(is.finite(xi))) {
+        contrib <- wi * Kv[j]
+        acc <- acc + contrib * xi
+        wsum <- wsum + contrib
+      }
     }
+    if (wsum > 1e-10) pred[l, ] <- acc / wsum
   }
   pred
 }
@@ -266,7 +320,8 @@ simulate_hexagon <- function(n = 30, sigma_noise = 0.05) {
   X_true <- vector("list", n)
   for (i in seq_len(n)) {
     t     <- times[i]
-    size  <- 1 + 0.6 * t                     # nonlinear growth in size
+    size  <- 1 + 0.6 * t                     # linear growth in size (referee note: comment
+                                              # previously said "nonlinear", which is incorrect)
     rot   <- t * pi / 6                      # rotation drift
     shear <- 0.3 * t                         # genuine SHAPE change (not just size/rotation)
     Sh <- matrix(c(1, 0, shear, 1), 2, 2)
@@ -279,16 +334,26 @@ simulate_hexagon <- function(n = 30, sigma_noise = 0.05) {
   list(times = times, X_true = X_true, X_noisy = X_noisy)
 }
 
+#' Referee fix (Major point 8): the previous version drew a single runif()
+#' per (configuration, landmark) and branched if/else, so a landmark could
+#' never be both missing and an outlier in the same draw -- the marginal
+#' probabilities (missing_prob, outlier_prob) were correct, but the two
+#' mechanisms were mutually exclusive rather than independent, which is not
+#' what the "Both" scenario in Table 1 was intended to represent. Missing
+#' and outlier status are now drawn with two independent Bernoulli trials
+#' per landmark, so they can co-occur (an outlier shift applied to an
+#' already-missing landmark is harmless: delta = 0 still zero-weights it in
+#' every downstream fit and prediction step).
 contaminate <- function(X_list, outlier_prob = 0, missing_prob = 0, outlier_sd = 3) {
   n <- length(X_list); k <- nrow(X_list[[1]]); p <- ncol(X_list[[1]])
   X_out <- X_list
   delta_list <- replicate(n, rep(1, k), simplify = FALSE)
   for (i in seq_len(n)) {
     for (l in seq_len(k)) {
-      u <- runif(1)
-      if (u < missing_prob) {
+      if (runif(1) < missing_prob) {
         delta_list[[i]][l] <- 0
-      } else if (u < missing_prob + outlier_prob) {
+      }
+      if (runif(1) < outlier_prob) {
         X_out[[i]][l, ] <- X_out[[i]][l, ] + rnorm(p, 0, outlier_sd)
       }
     }
@@ -307,7 +372,17 @@ procrustes_align_full <- function(Xhat, Xtrue) {
 
 eval_scenario <- function(pred_list, true_list, mean_true_shape) {
   n <- length(pred_list)
-  ss_res <- 0; ss_tot <- 0; rmsd_v <- numeric(n); sim_v <- numeric(n)
+  ss_res <- 0; ss_tot <- 0
+  # Referee fix (Major point 7): rmsd_v/sim_v used to be zero-initialized,
+  # so a time point with an undefined (NA) prediction silently contributed
+  # a 0 to both the RMSD and Sim means via `next`, while R2 was accumulated
+  # only from the valid time points -- three criteria computed over three
+  # different, undisclosed evaluation sets whenever a prediction was
+  # undefined. rmsd_v/sim_v are now NA by default and only the valid
+  # entries are averaged; the number of valid predictions is reported
+  # explicitly so a degenerate scenario is visible rather than silently
+  # diluting the mean.
+  rmsd_v <- rep(NA_real_, n); sim_v <- rep(NA_real_, n)
 
   for (i in seq_len(n)) {
     if (anyNA(pred_list[[i]])) next
@@ -327,8 +402,14 @@ eval_scenario <- function(pred_list, true_list, mean_true_shape) {
     scale_fac <- sqrt(sum(sweep(true_list[[i]], 2, colMeans(true_list[[i]]))^2))
     sim_v[i] <- 100 * max(0, 1 - sqrt(resid) / scale_fac)
   }
-  R2 <- 100 * (1 - ss_res / ss_tot)
-  list(R2 = R2, RMSD = 100 * mean(rmsd_v), Sim = mean(sim_v))
+
+  valid   <- !is.na(rmsd_v)
+  n_valid <- sum(valid)
+  R2 <- if (ss_tot > 1e-10) 100 * (1 - ss_res / ss_tot) else NA_real_
+  list(R2 = R2,
+       RMSD = if (n_valid > 0) 100 * mean(rmsd_v[valid]) else NA_real_,
+       Sim  = if (n_valid > 0) mean(sim_v[valid])         else NA_real_,
+       n_valid = n_valid, n_total = n)
 }
 
 # ---------------------------------------------------------------------------
@@ -341,8 +422,15 @@ eval_scenario <- function(pred_list, true_list, mean_true_shape) {
 # reader can see whether "mean" is being driven by a few extreme draws.
 # ---------------------------------------------------------------------------
 robust_summary <- function(x, trim = 0.10) {
-  c(min = min(x), mean = mean(x), median = stats::median(x),
-    trimmed = mean(x, trim = trim), max = max(x), sd = sd(x))
+  # na.rm = TRUE: eval_scenario() can now return NA_real_ for a replicate
+  # where every prediction was undefined (Major point 7 fix); such
+  # replicates are dropped from the summary rather than propagating NA
+  # through every reported statistic. n_ok records how many replicates
+  # actually contributed.
+  ok <- is.finite(x)
+  c(min = min(x[ok]), mean = mean(x[ok]), median = stats::median(x[ok]),
+    trimmed = mean(x[ok], trim = trim), max = max(x[ok]), sd = sd(x[ok]),
+    n_ok = sum(ok))
 }
 
 # ---------------------------------------------------------------------------
@@ -629,15 +717,31 @@ run_real_data_contamination_study <- function(times, X_list, n_rep = 40,
 # ---------------------------------------------------------------------------
 # Option A - the "shapes" R package (Dryden, 2019), as used in the original
 # paper (install.packages("shapes"); this environment has no CRAN access,
-# so this must be run on your own machine):
+# so this must be run on your own machine).
+#
+# IMPORTANT (referee report, minor point 4): shapes::rats$x is stored as a
+# FLAT 8 x 2 x 144 array (144 = 18 rats x 8 ages), with the rat ID and age
+# for each of the 144 slices given by the separate vectors rats$no and
+# rats$time -- it is NOT a 4-D k x p x n x N array, so an expression like
+# rats$x[, , , 2] is invalid (wrong number of dimensions) and array_to_configs()
+# does not apply to it directly. Extract one rat's 8 configurations, in time
+# order, using rats$no/rats$time instead (see rats_analysis_en.R for the
+# full, working version of this):
 #
 #   library(shapes)
-#   data(rats)                       # rats$x: 8 landmarks x 2 dims x 8 ages x 18 rats
-#   arr    <- rats$x[, , , 2]        # rat number 2 -> 8 x 2 x 8 array
-#   times  <- c(7, 14, 21, 30, 40, 60, 90, 150)
-#   X_rat2 <- array_to_configs(arr)  # list of 8 (8 x 2) configurations
-#   fit_real_data(times, X_rat2, method = "robust")
-#   study  <- run_real_data_contamination_study(times, X_rat2, n_rep = 40)
+#   data(rats)
+#   extract_rat <- function(rat_id) {
+#     idx <- which(rats$no == rat_id)
+#     ord <- order(rats$time[idx]); idx <- idx[ord]
+#     list(times = rats$time[idx], X_list = lapply(idx, function(i) rats$x[, , i]))
+#   }
+#   r2 <- extract_rat(2)             # rat number 2 -> times + list of 8 (8 x 2) configurations
+#   fit_real_data(r2$times, r2$X_list, method = "robust")
+#   study <- run_real_data_contamination_study(r2$times, r2$X_list, n_rep = 40)
+#
+# array_to_configs() (Section 10a above) is for the more common case of a
+# genuine, already-4-D k x p x n x N array (or a single k x p x n array) --
+# it is not needed for shapes::rats specifically.
 #
 # Option B - your own data, already as an RDS/csv you can turn into a list
 # of k x p matrices in R (one matrix per observed time), plus a numeric
