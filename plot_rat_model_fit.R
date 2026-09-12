@@ -56,9 +56,17 @@ fit_and_predict_loo <- function(times, X_list, method = "robust", h_grid = NULL)
   n <- length(times); k <- nrow(X_list[[1]])
   delta_list <- replicate(n, rep(1, k), simplify = FALSE)   # real data here: nothing missing
 
+  # Referee fix (minor point re: bandwidth): this used to default to
+  # length.out = 15, while run_real_data_contamination_study() in
+  # robust_shape_regression.R -- the function that actually produces the
+  # paper's Table 3 numbers -- uses length.out = 12. Two different grids
+  # for what is meant to be the same fit meant the R2/RMSD/Sim shown in
+  # this file's own figures were not guaranteed to match the corresponding
+  # table row. Unified to 12 here so the figure and the table come from
+  # the same bandwidth search.
   if (is.null(h_grid)) {
     span <- diff(range(times))
-    h_grid <- seq(span / 40, span / 2, length.out = 15)
+    h_grid <- seq(span / 40, span / 2, length.out = 12)
   }
 
   fitted <- fit_shape_model(times, X_list, delta_list, robust = (method == "robust"))
@@ -105,8 +113,17 @@ plot_rat_fit_overlay <- function(rat_id, method = "robust") {
   df_pred <- do.call(rbind, lapply(seq_along(d$times), function(i) {
     p <- fit$preds[[i]]
     if (anyNA(p)) return(NULL)   # LOO prediction undefined at that age/bandwidth
+    # Referee fix (Major point 6): align the prediction onto the observed
+    # configuration at the same age before plotting -- eval_scenario() (and
+    # therefore every R2/RMSD/Sim number in the paper) always compares a
+    # Procrustes-ALIGNED prediction to the target, never the raw output of
+    # nw_predict_shape() directly. Without this, a good prediction can look
+    # wrong here purely because of an arbitrary leftover rotation/scale/
+    # translation, and the two overlaid polygons are not the comparison the
+    # numbers in the subtitle actually summarize.
+    p_aligned <- procrustes_align_full(p, d$X_list[[i]])
     data.frame(Time = d$times[i], Landmark = seq_len(k),
-               X = p[, 1], Y = p[, 2], Source = "LOO prediction")
+               X = p_aligned[, 1], Y = p_aligned[, 2], Source = "LOO prediction")
   }))
 
   df <- rbind(df_obs, df_pred)
