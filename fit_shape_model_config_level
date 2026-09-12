@@ -53,9 +53,25 @@ fit_shape_model_config_level <- function(times, X_raw, delta_list, robust = TRUE
 
 # Same bandwidth-selection + LOO-prediction logic as run_method_once(), but
 # dispatching to fit_shape_model_config_level() for method == "config_robust".
+#
+# Referee fix (Major point 5): h_grid used to default to seq(0.02, 0.45, by
+# = 0.03), a grid hardcoded for the hexagon simulation's [0,1] time scale.
+# Passed real data on a different scale (e.g. rat ages in days, ~[7,150]),
+# every one of those bandwidths is tiny relative to the actual time range,
+# so the Gaussian kernel weights collapse to ~0 almost everywhere and the
+# fit is silently degenerate. h_grid is now derived from the actual `times`
+# argument by default -- the same span/40-to-span/2 rule already used by
+# fit_real_data() and run_real_data_contamination_study() in
+# robust_shape_regression.R -- so this comparator uses a bandwidth grid
+# that is actually appropriate to whatever data it is given, and matches
+# the landmark-level driver it is meant to be compared against.
 run_method_once_level <- function(times, X_raw, delta_list, X_true, method,
-                                   h_grid = seq(0.02, 0.45, by = 0.03)) {
+                                   h_grid = NULL) {
   n <- length(times)
+  if (is.null(h_grid)) {
+    span <- diff(range(times))
+    h_grid <- seq(span / 40, span / 2, length.out = 12)
+  }
   if (method == "naive") {
     X_used <- mean_impute(X_raw, delta_list)
     delta_used <- replicate(n, rep(1, nrow(X_raw[[1]])), simplify = FALSE)
